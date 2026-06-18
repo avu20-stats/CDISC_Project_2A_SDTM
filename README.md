@@ -7,8 +7,6 @@ Transforms raw CRF data from study **CMP135** into 5 SDTM domains (DM, EX, MH, D
 ```
 crfdata/                        # Raw CRF source datasets (SAS .sas7bdat / .xpt)
 SDTM Data for Validation/       # Reference SDTM XPT files for validation
-Reference SAS Codes/            # Original SAS mapping specifications (PDF)
-Project Docs/                   # Annotated CRF, protocol, SDTM specs
 Project 2-A.R                   # Main R script (all steps + validation)
 Project 2-A.Rmd                 # R Markdown version (knits to HTML)
 Project-2-A.html                # Compiled report
