@@ -1,4 +1,4 @@
-# CDISC SDTM Creation & Validation — Project 2-A
+# CDISC SDTM Creation & Validation - Project 2-A
 
 Transforms raw CRF data from study **CMP135** into 5 SDTM domains (DM, EX, MH, DS, VS) using R, and validates the output against gold-standard reference XPT files.
 
@@ -18,11 +18,11 @@ Project-2-A.html                # Compiled report
 
 | Domain | Description |
 |---|---|
-| **DM** | Demographics — subject-level data, arm assignment, investigator info |
-| **EX** | Exposure — dosing records with ISO 8601 datetime and study day |
-| **MH** | Medical History — MedDRA-coded terms (LLT → SOC) |
-| **DS** | Disposition — informed consent, completion, discontinuation |
-| **VS** | Vital Signs — TEMP, RESP, HR, WEIGHT, HEIGHT, SYSBP, DIABP |
+| **DM** | Demographics - subject-level data, arm assignment, investigator info |
+| **EX** | Exposure - dosing records with ISO 8601 datetime and study day |
+| **MH** | Medical History - MedDRA-coded terms (LLT → SOC) |
+| **DS** | Disposition - informed consent, completion, discontinuation |
+| **VS** | Vital Signs - TEMP, RESP, HR, WEIGHT, HEIGHT, SYSBP, DIABP |
 
 ## Usage
 
