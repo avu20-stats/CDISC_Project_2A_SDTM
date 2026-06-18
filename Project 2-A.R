@@ -1,0 +1,465 @@
+# Importing packages
+library(dplyr)
+library(stringr)
+library(lubridate)
+library(haven)
+
+# Reading raw datasets
+ae <- read_sas("crfdata/ae.sas7bdat")
+dm <- read_sas("crfdata/dm.sas7bdat") 
+dov <- read_sas("crfdata/dov.sas7bdat") 
+ds <- read_sas("crfdata/ds.sas7bdat") 
+dsdd <- read_sas("crfdata/dsdd.sas7bdat") 
+enr <- read_sas("crfdata/enr.sas7bdat")
+ex <- read_sas("crfdata/ex.sas7bdat") 
+inv <- read_sas("crfdata/inv.sas7bdat") 
+mh <- read_sas("crfdata/mh.sas7bdat") 
+vs <- read_sas("crfdata/vs.sas7bdat")
+se <- read_xpt("crfdata/se.xpt")
+
+# Reading validation datasets
+val_dm <- read_xpt("SDTM Data for Validation/xpt_new/dm.xpt")
+val_ex <- read_xpt("SDTM Data for Validation/xpt_new/ex.xpt")
+val_mh <- read_xpt("SDTM Data for Validation/xpt_new/mh.xpt")
+val_ds <- read_xpt("SDTM Data for Validation/xpt_new/ds.xpt")
+val_vs <- read_xpt("SDTM Data for Validation/xpt_new/vs.xpt")
+
+# Looking at structure of validation datasets
+#glimpse(val_dm)
+#glimpse(val_ex)
+#glimpse(val_mh)
+#glimpse(val_ds)
+#glimpse(val_vs)
+
+# DM Domain Creation ------------------------------------------------------
+# Exposure (EX) - Changed to ISO 8601 format
+ex_summary <- ex %>% filter(EXDOSE > 0) %>%
+mutate(date_clean = format(as_date(EXSTDTN), "%Y-%m-%d"),
+# Check if time exists. Otherwise, leave it empty (NA)
+  time_str = if (is.numeric(EXSTTM)) {
+    format(as.POSIXct(EXSTTM, origin = "1970-01-01", tz = "UTC"), "%H:%M")
+    } else {
+      if_else(!is.na(EXSTTM) & EXSTTM != "", str_pad(str_sub(EXSTTM, 1, 5), width = 5, pad = "0"), as.character(NA))
+    },
+    # If time is missing, use only the date. Otherwise, append 'T' and the time.
+    datetime_str = if_else(!is.na(time_str), paste0(date_clean, "T", time_str), date_clean)) %>%
+  group_by(SUBJECT) %>% summarise(
+    first_exp_dt = min(EXSTDTN, na.rm = TRUE),
+    last_exp_dt = max(EXSTDTN, na.rm = TRUE),
+    # Select the min and max datetimes for RFXSTDTC and RFXENDTC
+    RFXSTDTC = min(datetime_str, na.rm = TRUE),
+    RFXENDTC = max(datetime_str, na.rm = TRUE),
+    max_dose = max(EXDOSE, na.rm = TRUE), .groups = "drop")
+
+# Adverse Events (AE) - Extracting death date if AE outcome is "Fatal"
+ae_death <- ae %>% group_by(SUBJECT) %>%
+  summarise(
+    death_dt = if(any(AEOUT == "Fatal" & !is.na(AESTDTN))) max(as_date(AESTDTN[AEOUT == "Fatal"]), na.rm = TRUE) else as_date(NA),
+    .groups = "drop") %>% filter(!is.na(death_dt))
+
+# Disposition (DS) Summary - Fixed to use DSSTDAT
+ds_summary <- ds %>% filter(!is.na(DSSTDAT)) %>%
+  mutate(eos_dt = as_date(DSSTDAT)) %>% select(SUBJECT, eos_dt)
+
+# Visit Date (DOV) - Extracting screening visit date
+dov_summary <- dov %>%
+  filter(toupper(FOLDERNAME) == "SCREENING") %>%
+  mutate(screening_dt = as_date(VISDTN)) %>%
+  select(SUBJECT, screening_dt)
+
+# Build SDTM DM dataset
+sdtm_dm <- dm %>%
+  mutate(
+    # Extract site number
+    padded_site = str_pad(str_extract(as.character(SITENUMBER), "^\\d+"), width = 4, pad = "0")) %>%
+    left_join(enr, by = "SUBJECT") %>%
+    left_join(ex_summary, by = "SUBJECT") %>%
+    left_join(ds_summary, by = "SUBJECT") %>%
+    left_join(ae_death, by = "SUBJECT") %>%
+    left_join(dov_summary, by = "SUBJECT") %>%
+    left_join(inv, by = c("padded_site" = "SITEID")) %>%
+  mutate(
+    STUDYID = "CMP135",
+    DOMAIN  = "DM",
+    # SUBJID format as "Site-Subject"
+    SUBJID = paste(padded_site, str_extract(as.character(SUBJECT), "\\d+$"), sep = "-"),
+    # Concatenating STUDYID and SUBJID
+    USUBJID = paste(STUDYID, SUBJID, sep = "-"),
+    # Date variables formatting
+    RFSTDTC = if_else(!is.na(first_exp_dt), format(as_date(first_exp_dt), "%Y-%m-%d"), ""),
+    RFENDTC = if_else(!is.na(eos_dt), format(eos_dt, "%Y-%m-%d"), ""),
+    RFICDTC = if_else(!is.na(CNSTDTN), format(as_date(CNSTDTN), "%Y-%m-%d"), ""),
+    RFPENDTC = RFENDTC,
+    DTHDTC = if_else(!is.na(death_dt), format(death_dt, "%Y-%m-%d"), ""),
+    DTHFL = if_else(DTHDTC != "", "Y", ""),
+    SITEID = padded_site,
+    INVID = str_pad(as.character(INVID), width = 4, pad = "0"),
+    # Truncate to 13 characters
+    INVNAM = str_sub(paste(INVFNAME, INVLNAME), 1, 13),
+    # Birthdate variables formatting
+    BRTHDTC = if_else(!is.na(BRTHDTN), format(as_date(BRTHDTN), "%Y-%m-%d"), ""),
+    # Age Calculation
+    AGE = if_else(!is.na(BRTHDTN) & !is.na(CNSTDTN), 
+      as.numeric(trunc(interval(as_date(BRTHDTN), as_date(CNSTDTN)) / years(1))), NA_real_),
+    AGEU = "YEARS",
+    SEX = if_else(toupper(SEX_COD) %in% c("FEMALE", "F"), "F", "M"),
+    RACE = toupper(as.character(RACE)),
+    ETHNIC = toupper(as.character(ETHNIC)),
+    ARMCD = if_else(str_detect(toupper(ENRGRP), "GROUP 1"), "CMP135_5", ""),
+    ARM = if_else(str_detect(toupper(ENRGRP), "GROUP 1"), "Group 1", ""),
+    ACTARMCD = if_else(!is.na(max_dose) & max_dose > 0, "CMP135_5", "NOTTREAT"),
+    ACTARM = if_else(!is.na(max_dose) & max_dose > 0, "Group 1", "Not Treated"),
+    COUNTRY = as.character(COUNTRY),
+    DMDTC = if_else(!is.na(screening_dt), format(screening_dt, "%Y-%m-%d"), ""),
+    # Study Day Calculation
+    DMDY = if_else(!is.na(screening_dt) & !is.na(first_exp_dt),
+      if_else(screening_dt >= as_date(first_exp_dt),
+      as.numeric(screening_dt - as_date(first_exp_dt)) + 1,
+      as.numeric(screening_dt - as_date(first_exp_dt))), NA_real_)) %>%
+  select(SUBJECT, names(val_dm)) %>%
+  arrange(USUBJID)
+
+# EX Domain Creation ------------------------------------------------------
+# Subject Elements (SE) - Preparing for epoch derivation
+se_clean <- se %>%
+  select(USUBJID, SESTDTC, SEENDTC, EPOCH) %>%
+  mutate(SESTDTC = as_date(SESTDTC), SEENDTC = as_date(SEENDTC))
+
+# Build SDTM EX dataset
+sdtm_ex <- ex %>%
+  filter(!is.na(EXDOSE) & EXDOSE > 0) %>%  
+  mutate(
+    DOMAIN = "EX",
+    STUDYID = "CMP135",
+    EXTRT = "CMP135", 
+    EXDOSE = as.numeric(EXDOSE),
+    EXDOSU = "mg",         
+    EXDOSFRM = "INJECTION",
+    EXROUTE = "SUBCUTANEOUS",
+    # Pad site numbers and format USUBJID
+    padded_site = str_pad(str_extract(as.character(SITENUMBER), "^\\d+"), width = 4, pad = "0"),
+    subjid_fmt = paste(padded_site, str_extract(as.character(SUBJECT), "\\d+$"), sep = "-"),
+    USUBJID = paste(STUDYID, subjid_fmt, sep = "-"),
+    # Date extraction
+    date_clean = format(as_date(EXSTDTN), "%Y-%m-%d"),
+    time_str = if (is.numeric(EXSTTM)) {
+      format(as.POSIXct(EXSTTM, origin = "1970-01-01", tz = "UTC"), "%H:%M")
+    } else {
+      if_else(!is.na(EXSTTM) & EXSTTM != "", str_pad(str_sub(EXSTTM, 1, 5), width = 5, pad = "0"), as.character(NA))
+    },
+    EXSTDTC  = if_else(!is.na(time_str), paste0(date_clean, "T", time_str), date_clean),
+    ex_date_parsed = as_date(date_clean)
+  ) %>%
+  # Calculate Study Day (EXSTDY) based on first exposure
+  group_by(USUBJID) %>%
+  mutate(
+    RFSTDTC_derived = min(date_clean, na.rm = TRUE),
+      rf_date_parsed = as_date(RFSTDTC_derived), 
+    EXSTDY = if_else(!is.na(ex_date_parsed) & !is.na(rf_date_parsed),
+      if_else(ex_date_parsed >= rf_date_parsed,
+      as.numeric(ex_date_parsed - rf_date_parsed) + 1,
+      as.numeric(ex_date_parsed - rf_date_parsed)), NA_real_)) %>% ungroup() %>%
+  # Deriving Epoch
+  mutate(row_id = row_number()) %>% # Track temporary rows
+  left_join(se_clean, by = "USUBJID", relationship = "many-to-many") %>% group_by(row_id) %>%
+  filter(
+    (ex_date_parsed >= SESTDTC & ex_date_parsed < SEENDTC) |
+    (ex_date_parsed == SEENDTC & SEENDTC == max(SEENDTC, na.rm = TRUE))) %>%
+  slice(1) %>% # Keep the first matching epoch if overlap occurs
+  ungroup() %>% select(-row_id, -SESTDTC, -SEENDTC) %>%
+  # Handling of EXLOC combined with potential record deduplication
+  group_by(USUBJID, EXSTDTC) %>%
+  mutate(
+    EXLOC_raw = case_when(
+      !is.na(EXLOCOTH) & EXLOCOTH != "" ~ toupper(str_trim(EXLOCOTH)),
+      !is.na(EXLOC) ~ toupper(str_trim(EXLOC)), TRUE ~ ""),
+    EXLOC = paste(unique(EXLOC_raw), collapse = "; ")) %>% # Combines injection sites if given on same day/time
+  slice(1) %>% ungroup() %>%
+  # Sequence and finalize structure
+  arrange(STUDYID, USUBJID, EXTRT, EXSTDTC) %>% group_by(USUBJID) %>%
+  mutate(EXSEQ = as.numeric(row_number())) %>%
+  ungroup() %>% select(all_of(names(val_ex)))
+
+# MH Domain Creation ------------------------------------------------------
+# Merge MH with DM (to get STUDYID, USUBJID, RFSTDTC)
+mh_dm <- mh %>% left_join(sdtm_dm %>% select(SUBJECT, STUDYID, USUBJID, RFSTDTC), by = "SUBJECT") %>%
+  # Add DOV summary information
+  left_join(dov_summary, by = "SUBJECT") 
+
+# Function to construct ISO 8601 dates from partial components
+std_end_date <- function(y, m, d) {
+  ifelse(is.na(y), "",
+  ifelse(is.na(m), sprintf("%04d", y),
+  ifelse(is.na(d), sprintf("%04d-%02d", y, m),
+         sprintf("%04d-%02d-%02d", y, m, d))))}
+
+# Build SDTM MH dataset
+sdtm_mh <- mh_dm %>%
+  mutate(
+    DOMAIN = "MH",
+    STUDYID = PROJECT,
+    # Standardize text fields
+    MHTERM = str_trim(MHTERM),
+    MHDECOD = str_trim(MHTERM_PT), 
+    MHCAT = "GENERAL MEDICAL HISTORY",
+    # Start and end dates using partial date function
+    MHSTDTC = std_end_date(MHSTDTN_YY, MHSTDTN_MM, MHSTDTN_DD),
+    MHENDTC = std_end_date(MHENDTN_YY, MHENDTN_MM, MHENDTN_DD),
+    # Medical history collection date (screening date)
+    MHDTC = if_else(!is.na(screening_dt), format(screening_dt, "%Y-%m-%d"), ""), 
+    # MedDRA coding fields
+    MHLLT = str_trim(MHTERM_LLT),
+    MHLLTCD = as.numeric(MHTERM_LLT_CODE),
+    MHPT = toupper(str_trim(MHTERM_PT)),
+    MHPTCD = as.numeric(MHTERM_PT_CODE),
+    MHHLT = str_trim(MHTERM_HLT),
+    MHHLTCD = as.numeric(MHTERM_HLT_CODE),
+    MHHLGT = str_trim(MHTERM_HLGT),
+    MHHLGTCD = as.numeric(MHTERM_HLGT_CODE),
+    MHSOC = str_trim(MHTERM_SOC),
+    MHSOCCD = as.numeric(MHTERM_SOC_CODE),
+    MHBODSYS = str_trim(MHTERM_SOC),
+    MHBDSYCD = as.numeric(MHTERM_SOC_CODE),
+    MHENRTPT = if_else(MHONG == "1", "ONGOING", ""),
+    MHENTPT = if_else(MHENRTPT == "ONGOING", MHDTC, ""),
+    MHDY = as.numeric(as.Date(MHDTC) - as.Date(RFSTDTC))) %>%
+  arrange(USUBJID, MHTERM) %>%
+  group_by(USUBJID) %>%
+  mutate(MHSEQ = as.numeric(row_number())) %>%
+  ungroup() %>%
+  rename_with(toupper) %>%
+  select(-SUBJECT) %>%
+  select(all_of(names(val_mh))) %>%
+  arrange(USUBJID, MHSEQ)
+
+# DS Domain Creation ------------------------------------------------------
+# Creating reference map 
+dm_ref <- sdtm_dm %>% 
+  select(SUBJECT, STUDYID, USUBJID, RFSTDTC)
+
+ds_combined <- bind_rows(
+  ds   %>% mutate(SOURCE = "DS",   DSDECOD_COD = as.character(DSDECOD_COD)), 
+  dsdd %>% mutate(SOURCE = "DSDD", DSDECOD_COD = as.character(DSDECOD_COD)))
+
+# Protocol Milestones (Informed Consent)
+ds_consent <- enr %>%
+  left_join(dm_ref, by = "SUBJECT") %>%
+  filter(!is.na(CNSTDTN)) %>%
+  mutate(
+    DOMAIN = "DS",
+    DSTERM = "INFORMED CONSENT OBTAINED",
+    DSDECOD = "INFORMED CONSENT OBTAINED",
+    DSCAT = "PROTOCOL MILESTONE",
+    DSSCAT = "INFORMED CONSENT",
+    DSSTDTC = format(as_date(CNSTDTN), "%Y-%m-%d"),
+    EPOCH = "", 
+    DSSTDY = as.numeric(as_date(CNSTDTN) - as_date(RFSTDTC)) + 
+      if_else(as_date(CNSTDTN) >= as_date(RFSTDTC), 1, 0))
+
+# Raw stack with unified date columns
+ds_combined <- bind_rows(
+  ds   %>% mutate(SOURCE = "DS",   DSDECOD_COD = as.character(DSDECOD_COD)), 
+  dsdd %>% mutate(SOURCE = "DSDD", DSDECOD_COD = as.character(DSDECOD_COD)) %>%
+  rename(DSSTDAT_YY = DSSTDTN_YY, DSSTDAT_MM = DSSTDTN_MM, DSSTDAT_DD = DSSTDTN_DD))
+
+# Clean Dispositions & Safe Epoch Join
+ds_disposition <- ds_combined %>%
+  left_join(dm_ref, by = "SUBJECT") %>%
+  mutate(
+    DOMAIN = "DS",
+    DSTERM = if_else(str_trim(toupper(DSDECOD)) == "COMPLETED STUDY", "COMPLETED", str_trim(toupper(DSDECOD))), 
+    DSDECOD = DSTERM,
+    DSCAT = "DISPOSITION EVENT",
+    DSSCAT = if_else(SOURCE == "DS", "END OF STUDY", "STUDY DRUG DISCONTINUATION"), 
+    DSSTDTC = sprintf("%04d-%02d-%02d", as.numeric(DSSTDAT_YY), as.numeric(DSSTDAT_MM), as.numeric(DSSTDAT_DD)),
+    DSSTDY = as.numeric(as.Date(DSSTDTC) - as.Date(RFSTDTC)) + if_else(as.Date(DSSTDTC) >= as.Date(RFSTDTC), 1, 0)) %>%
+  # Row ID created to prevent losing data rows when removing duplicate epochs
+  mutate(row_id = row_number()) %>%
+  left_join(se_clean, by = "USUBJID") %>%
+  # Capture rows falling into the epoch window
+  filter(as.Date(DSSTDTC) >= SESTDTC & as.Date(DSSTDTC) <= SEENDTC) %>%
+  # Keep only one duplicate if an event date lands on a shared epoch boundary
+  group_by(row_id) %>%
+  arrange(desc(SESTDTC)) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(-SESTDTC, -SEENDTC, -SOURCE, -row_id)
+
+# Build SDTM MH dataset reorganize data to match validation dataset
+sdtm_ds <- bind_rows(ds_disposition, ds_consent) %>%
+  rename_with(toupper) %>%
+  arrange(USUBJID, DSCAT, DSSTDTC) %>%
+  group_by(USUBJID) %>%
+  mutate(DSSEQ = as.numeric(row_number())) %>%
+  ungroup() %>% select(names(val_ds))
+
+# VS Domain Creation ------------------------------------------------------
+# Clean Visit Dates (DOV)
+dov_clean <- dov %>%
+  mutate(
+    STUDYID = "CMP135",
+    USUBJID = paste(STUDYID, SUBJECT, sep = "-"),
+    DOV_DATE = if_else(
+      !is.na(VISDTN_YY) & !is.na(VISDTN_MM) & !is.na(VISDTN_DD),
+      make_date(VISDTN_YY, VISDTN_MM, VISDTN_DD),
+      as_date(VISDTN))) %>% # Use numeric date tracking if components are not individual
+  select(USUBJID, FOLDERSEQ, INSTANCENAME, DOV_DATE) %>%
+  distinct(USUBJID, FOLDERSEQ, INSTANCENAME, .keep_all = TRUE)
+
+# Rounding function to help match validation data
+round_half_up <- function(x) as.integer(x + 0.5)
+
+# Building intermediate VS domain
+sdtm_vs_built <- vs %>%
+  left_join(dm_ref, by = "SUBJECT") %>%
+  left_join(dov_clean, by = c("USUBJID", "FOLDERSEQ", "INSTANCENAME")) %>%
+  mutate(
+    DOMAIN = "VS",
+    VSCAT = DATAPAGENAME, 
+    VSTESTCD = case_when(
+      str_detect(toupper(VSTEST), "TEMPERATURE") ~ "TEMP",
+      str_detect(toupper(VSTEST), "RESPIRATORY") ~ "RESP",
+      str_detect(toupper(VSTEST), "HEART RATE|PULSE") ~ "HR",
+      str_detect(toupper(VSTEST), "WEIGHT") ~ "WEIGHT",
+      str_detect(toupper(VSTEST), "SYSTOLIC") ~ "SYSBP",
+      str_detect(toupper(VSTEST), "DIASTOLIC") ~ "DIABP",
+      str_detect(toupper(VSTEST), "HEIGHT") ~ "HEIGHT",
+      TRUE ~ NA_character_),
+    VSTEST   = str_to_title(VSTEST),
+    # Base Raw Result Clean up
+    VSORRES = if_else(
+      VSPERF_COD == "N" | is.na(VSORRES) | VSORRES %in% c("", "U", "X"),
+      ".", str_trim(as.character(VSORRES))),
+    # Making rounding adjustments
+    VSORRES = if_else(
+      VSTESTCD %in% c("HEIGHT", "WEIGHT", "TEMP") & VSORRES != ".",
+      as.character(round_half_up(as.numeric(VSORRES))),
+      VSORRES),
+    VSORRESU = case_when(
+      VSTESTCD == "TEMP" ~ "C",
+      VSTESTCD == "RESP" ~ "BREATHS/MIN",
+      VSTESTCD == "HR" ~ "BEATS/MIN",
+      #VSTESTCD == "WEIGHT" ~ "kg",
+      #VSTESTCD == "HEIGHT" ~ "cm",
+      VSTESTCD %in% c("SYSBP", "DIABP") ~ "mmHg",
+      TRUE ~ ""),
+    VSSTRESU = VSORRESU, 
+    VSSTRESC = VSORRES, 
+    VSSTRESN = if_else(VSORRES == ".", NA_real_, as.numeric(VSORRES) / 10), 
+    VSSTAT = if_else(str_trim(VSORRES_RAW) %in% c("U", "X"), "NOT DONE", ""),
+    # Build clean target collection date using DOV or VSDTN fallback
+    VSDTC = if_else(!is.na(DOV_DATE), format(DOV_DATE, "%Y-%m-%d"), 
+      if_else(!is.na(VSDTN), format(as_date(VSDTN), "%Y-%m-%d"), "")),
+    # Base Scheduled Visit Numbers Setup
+    folder_num = as.numeric(str_extract(FOLDERNAME, "\\d+")),
+    VISITNUM = case_when(
+      toupper(FOLDERNAME) == "SCREENING" ~ -1.00,
+      !str_detect(toupper(FOLDERNAME), "UNSCHEDULED|SYSTEMIC") & !is.na(folder_num) ~ (folder_num - 1) * 7 + 1,
+      TRUE ~ NA_real_),
+    VSBLFL = if_else(VSCAT == "Vital Signs Day 1", "Y", ""))
+
+# Create map to resolve Unscheduled/Systemic visit numbers
+uns_srv_map <- sdtm_vs_built %>%
+  filter(str_detect(toupper(FOLDERNAME), "UNSCHEDULED|SYSTEMIC")) %>%
+  distinct(USUBJID, FOLDERSEQ, VSDTC) %>%
+  left_join(
+    sdtm_vs_built %>%
+      filter(!str_detect(toupper(FOLDERNAME), "UNSCHEDULED|SYSTEMIC"), !is.na(VISITNUM)) %>%
+      distinct(USUBJID, FOLDERSEQ, VISITNUM, VSDTC) %>%
+      rename(SCHED_FOLDERSEQ = FOLDERSEQ, SCHED_VISITNUM = VISITNUM, SCHED_VSDTC = VSDTC),
+    by = "USUBJID", relationship = "many-to-many") %>%
+  filter(as.Date(VSDTC) >= as.Date(SCHED_VSDTC)) %>%
+  group_by(USUBJID, FOLDERSEQ, VSDTC) %>%
+  slice_max(SCHED_VISITNUM, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(VISITNUM_NEW = SCHED_VISITNUM + 0.01) %>%
+  select(USUBJID, FOLDERSEQ, VSDTC, VISITNUM_NEW)
+
+# Build final SDTM MH dataset
+sdtm_vs <- sdtm_vs_built %>%
+  left_join(uns_srv_map, by = c("USUBJID", "FOLDERSEQ", "VSDTC")) %>%
+  mutate(
+    VISITNUM = if_else(is.na(VISITNUM), VISITNUM_NEW, VISITNUM),
+    VISIT = case_when(
+      toupper(FOLDERNAME) == "SCREENING" ~ "Screening",
+      str_detect(toupper(FOLDERNAME), "SYSTEMIC") ~ paste0("Systemic-", VISITNUM),
+      str_detect(toupper(FOLDERNAME), "UNSCHEDULED") ~ paste0("Unsched-", VISITNUM),
+      TRUE ~ INSTANCENAME),
+    VSDY = as.numeric(as.Date(VSDTC) - as.Date(RFSTDTC)) + if_else(as.Date(VSDTC) >= as.Date(RFSTDTC), 1, 0)) %>%
+  select(-folder_num, -VISITNUM_NEW, -DOV_DATE)
+
+# Extracting epoch data with start-window
+vs_epochs <- sdtm_vs %>%
+  select(USUBJID, VSDTC) %>%
+  filter(VSDTC != "") %>%
+  distinct() %>%
+  mutate(row_idx = row_number()) %>%
+  left_join(se_clean, by = "USUBJID", relationship = "many-to-many") %>%
+  filter(as.Date(VSDTC) >= SESTDTC & as.Date(VSDTC) <= SEENDTC) %>%
+  group_by(row_idx) %>%
+  slice_max(SESTDTC, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(USUBJID, VSDTC, EPOCH)
+
+# Combine and reorganize data to match validation dataset
+sdtm_vs <- sdtm_vs %>%
+  left_join(vs_epochs, by = c("USUBJID", "VSDTC")) %>%
+  arrange(USUBJID, VSTESTCD, VISITNUM) %>% 
+  group_by(USUBJID) %>%
+  mutate(VSSEQ = as.numeric(row_number())) %>%
+  ungroup() %>%
+  select(names(val_vs))
+
+#Comparing with validation datasets ---------------------------------------
+# Removing SUBJECT column from sdtm_dm
+sdtm_dm <- sdtm_dm %>% select(-SUBJECT)
+# Copy column attributes (labels/formats) from validation data to derived data
+for (col in colnames(val_dm)) {
+  if (col %in% colnames(sdtm_dm)) {
+    attributes(sdtm_dm[[col]]) <- attributes(val_dm[[col]])}}
+for (col in colnames(val_ex)) {
+  if (col %in% colnames(sdtm_ex)) {
+    attributes(sdtm_ex[[col]]) <- attributes(val_ex[[col]])}}
+for (col in colnames(val_mh)) {
+  if (col %in% colnames(sdtm_mh)) {
+    attributes(sdtm_mh[[col]]) <- attributes(val_mh[[col]])}}
+for (col in colnames(val_ds)) {
+  if (col %in% colnames(sdtm_ds)) {
+    attributes(sdtm_ds[[col]]) <- attributes(val_ds[[col]])}}
+for (col in colnames(val_vs)) {
+  if (col %in% colnames(sdtm_vs)) {
+    attributes(sdtm_vs[[col]]) <- attributes(val_vs[[col]])}}
+
+# Copy data frame attributes
+comment(sdtm_dm) <- comment(val_dm)
+comment(sdtm_ex) <- comment(val_ex)
+comment(sdtm_mh) <- comment(val_mh)
+comment(sdtm_ds) <- comment(val_ds)
+comment(sdtm_vs) <- comment(sdtm_vs)
+
+# DM - IDENTICAL
+identical(sdtm_dm, val_dm)
+all.equal(sdtm_dm, val_dm)
+anti_join(sdtm_dm, val_dm, by = "USUBJID")
+anti_join(val_dm, sdtm_dm, by = "USUBJID")
+# EX - IDENTICAL 
+identical(sdtm_ex, val_ex)
+all.equal(sdtm_ex, val_ex)
+anti_join(sdtm_ex, val_ex, by = "USUBJID")
+anti_join(val_ex, sdtm_ex, by = "USUBJID")
+# MH - IDENTICAL
+identical(sdtm_mh, val_mh)
+all.equal(sdtm_mh, val_mh)
+anti_join(sdtm_mh, val_mh, by = "USUBJID")
+anti_join(val_mh, sdtm_mh, by = "USUBJID")
+# DS - IDENTICAL
+identical(sdtm_ds, val_ds)
+all.equal(sdtm_ds, val_ds)
+anti_join(sdtm_ds, val_ds, by = "USUBJID")
+anti_join(val_ds, sdtm_ds, by = "USUBJID")
+# VS - IDENTICAL
+identical(sdtm_vs, val_vs)
+all.equal(sdtm_vs, val_vs)
+anti_join(sdtm_vs, val_vs, by = "USUBJID")
+anti_join(val_vs, sdtm_vs, by = "USUBJID")
+
