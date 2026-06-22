@@ -410,9 +410,10 @@ sdtm_vs <- sdtm_vs %>%
   ungroup() %>%
   select(names(val_vs))
 
-#Comparing with validation datasets ---------------------------------------
+# Comparing with validation datasets ---------------------------------------
 # Removing SUBJECT column from sdtm_dm
 sdtm_dm <- sdtm_dm %>% select(-SUBJECT)
+
 # Copy column attributes (labels/formats) from validation data to derived data
 for (col in colnames(val_dm)) {
   if (col %in% colnames(sdtm_dm)) {
